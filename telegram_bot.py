@@ -22,6 +22,13 @@ import json
 import os
 import sys
 import traceback
+
+# Fix Windows console encoding (must be before any output)
+if sys.platform == "win32":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    os.environ["PYTHONIOENCODING"] = "utf-8"
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any

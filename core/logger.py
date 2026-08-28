@@ -8,6 +8,9 @@ import logging
 from datetime import datetime
 from typing import Optional
 
+import io
+import os
+
 try:
     from rich.console import Console
     from rich.text import Text
@@ -21,7 +24,14 @@ try:
         "debug": "dim white",
         "critical": "bold white on red",
     })
-    _console = Console(theme=_theme, highlight=False)
+    # Force UTF-8 safe output on Windows
+    _console = Console(
+        theme=_theme,
+        highlight=False,
+        force_terminal=True,
+        force_jupyter=False,
+        safe_box=True,
+    )
     RICH_AVAILABLE = True
 except ImportError:
     RICH_AVAILABLE = False
@@ -43,12 +53,12 @@ class Logger:
     }
 
     ICONS = {
-        "DEBUG": "◌",
-        "INFO": "●",
-        "SUCCESS": "✓",
-        "WARNING": "⚠",
-        "ERROR": "✗",
-        "CRITICAL": "☠",
+        "DEBUG": "[D]",
+        "INFO": "[*]",
+        "SUCCESS": "[+]",
+        "WARNING": "[!]",
+        "ERROR": "[x]",
+        "CRITICAL": "[!!]",
     }
 
     COLORS = {
