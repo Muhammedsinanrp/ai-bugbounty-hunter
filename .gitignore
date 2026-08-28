@@ -15,6 +15,9 @@ env/
 config.local.json
 *.env.local
 
+# Telegram bot token — NEVER commit this
+bot_config.json
+
 # Findings database (user data)
 findings_db/*.db
 

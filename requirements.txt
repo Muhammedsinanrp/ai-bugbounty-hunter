@@ -22,6 +22,9 @@ tqdm>=4.66
 # ── Data & Utils ─────────────────────────────────────────────────
 ujson>=5.9
 
+# ── Telegram Bot ─────────────────────────────────────────────────
+python-telegram-bot>=21.0
+
 # ── Web3 (optional — uncomment if needed) ───────────────────────
 # web3>=6.0
 # eth-brownie>=1.20
