@@ -270,90 +270,328 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async def run_scan():
         try:
-            from core.agent import AIAgent
+            from recon.subdomain import SubdomainEnumerator
+            from recon.port_scanner import PortScanner
+            from recon.tech_detect import TechDetector
+            from recon.url_crawler import URLCrawler
+            from recon.osint import OSINTEnricher
+            from scanners.xss_scanner import XSSScanner
+            from scanners.sqli_scanner import SQLIScanner
+            from scanners.ssrf_scanner import SSRFScanner
+            from scanners.ssti_scanner import SSTIScanner
+            from scanners.lfi_scanner import LFIScanner
+            from scanners.open_redirect import OpenRedirectScanner
+            from scanners.idor_scanner import IDORScanner
+            from scanners.api_tester import APITester
+            from ai_engine.analyzer import AIAnalyzer
+            from ai_engine.validator import AIValidator
+            from ai_engine.report_gen import AIReportGenerator
+            from core.database import FindingsDB
+
             cfg = s.get_config()
             cfg.set_target(target)
-            agent = AIAgent(cfg)
+            scan_db = FindingsDB()
+            all_findings = []
+            t_start = datetime.utcnow()
 
-            def on_progress(phase: str, pct: int):
-                s.scan_phase = phase
-                s.scan_pct = pct
+            async def notify(text: str):
+                await safe_reply(update, text)
 
-            agent.register_progress_callback(on_progress)
-
-            PHASE_MSGS = {
-                "recon":       "🔭 *Phase 1/5 — Reconnaissance*\nDiscovering subdomains...",
-                "enumeration": "📡 *Phase 2/5 — Surface Enumeration*\nProbing live hosts & crawling URLs...",
-                "scanning":    "🛡 *Phase 3/5 — Vulnerability Scanning*\nRunning XSS, SQLi, SSRF, LFI & more...",
-                "ai_analysis": "🤖 *Phase 4/5 — AI Analysis*\nValidating findings through AI gate...",
-                "reporting":   "📝 *Phase 5/5 — Report Generation*\nBuilding submission-ready reports...",
-            }
-            last_phase = ""
-
-            async def phase_notifier():
-                nonlocal last_phase
-                while True:
-                    await asyncio.sleep(4)
-                    cur = s.scan_phase
-                    if cur != last_phase and cur in PHASE_MSGS:
-                        await safe_reply(update, PHASE_MSGS[cur])
-                        last_phase = cur
-
-            notifier = asyncio.create_task(phase_notifier())
-            summary = await agent.run_full_pipeline(target)
-            notifier.cancel()
-
-            # ── Results ──────────────────────────────────────────────
-            total = summary.get("findings_total", 0)
-            crit  = summary.get("critical_findings", 0)
-            high  = summary.get("high_findings", 0)
-            med   = summary.get("medium_findings", 0)
-            low_  = summary.get("low_findings", 0)
-            dur   = summary.get("duration_seconds", 0)
-
-            msg = (
-                f"✅ *Scan Complete!*\n\n"
+            # ══════════════════════════════════════════════════
+            # PHASE 1: RECONNAISSANCE
+            # ══════════════════════════════════════════════════
+            s.scan_phase = "recon"
+            await notify(
+                "🔭 *Phase 1/5 — Reconnaissance*\n\n"
                 f"🎯 Target: `{target}`\n"
-                f"⏱ Duration: `{dur:.1f}s`\n\n"
-                f"📊 *Recon:*\n"
-                f"• Subdomains: `{summary.get('subdomains_found', 0)}`\n"
-                f"• Live hosts: `{summary.get('live_hosts', 0)}`\n"
-                f"• URLs crawled: `{summary.get('urls_crawled', 0)}`\n"
-                f"• Parameters: `{summary.get('parameters_discovered', 0)}`\n\n"
-                f"🔎 *Findings: {total}*\n"
+                "Querying CRT.sh, Wayback Machine, SecurityTrails...\n"
+                "Predicting subdomains with AI patterns..."
             )
-            if crit: msg += f"  🔴 Critical: `{crit}`\n"
-            if high: msg += f"  🟠 High:     `{high}`\n"
-            if med:  msg += f"  🟡 Medium:   `{med}`\n"
-            if low_: msg += f"  🔵 Low:      `{low_}`\n"
-            if not total: msg += "  ✅ No vulnerabilities found\n"
-            msg += "\nUse /findings or /report to review results."
+
+            enum = SubdomainEnumerator(cfg)
+            subdomains = await enum.discover(target)
+
+            # Show discovered subdomains
+            sub_preview = "\n".join(f"  • `{s_}`" for s_ in subdomains[:15])
+            if len(subdomains) > 15:
+                sub_preview += f"\n  _...+{len(subdomains)-15} more_"
+
+            await notify(
+                f"✅ *Recon done!*\n\n"
+                f"🔍 Found `{len(subdomains)}` subdomains:\n"
+                f"{sub_preview if subdomains else '  _None found — using root domain_'}"
+            )
+
+            # ══════════════════════════════════════════════════
+            # PHASE 2: SURFACE ENUMERATION
+            # ══════════════════════════════════════════════════
+            s.scan_phase = "enumeration"
+            await notify(
+                "📡 *Phase 2/5 — Surface Enumeration*\n\n"
+                f"Probing `{len(subdomains) or 1}` hosts for HTTP/HTTPS...\n"
+                "Detecting technology stacks...\n"
+                "Crawling URLs and extracting parameters..."
+            )
+
+            # Live host probe
+            port_scanner = PortScanner(cfg)
+            live_hosts = await port_scanner.scan(subdomains or [target])
+
+            # Tech detection
+            tech_detector = TechDetector(cfg)
+            tech_stack = await tech_detector.fingerprint(live_hosts)
+
+            # Build tech summary
+            tech_lines = []
+            for host, techs in list(tech_stack.items())[:6]:
+                short = host.replace("https://","").replace("http://","")[:35]
+                tech_lines.append(f"  • `{short}`: {', '.join(techs[:5])}")
+
+            # URL crawling
+            crawler = URLCrawler(cfg)
+            crawl_results = await crawler.crawl(live_hosts)
+            all_urls = crawl_results.get("urls", [])
+            all_params = crawl_results.get("parameters", [])
+
+            await notify(
+                f"✅ *Enumeration done!*\n\n"
+                f"🌐 Live hosts: `{len(live_hosts)}`\n"
+                f"🔗 URLs found: `{len(all_urls)}`\n"
+                f"🔢 Parameters: `{len(all_params)}`\n\n"
+                f"*Tech Stack:*\n"
+                f"{chr(10).join(tech_lines) if tech_lines else '  _Not detected_'}"
+            )
+
+            # OSINT enrichment (quick, non-blocking)
+            try:
+                osint = OSINTEnricher(cfg)
+                osint_data = await osint.enrich(target)
+                if osint_data:
+                    ip = osint_data.get("ip", "?")
+                    org = osint_data.get("org", "?")
+                    country = osint_data.get("country", "?")
+                    await notify(
+                        f"🌍 *OSINT Intel*\n\n"
+                        f"🖥 IP: `{ip}`\n"
+                        f"🏢 Org: `{org}`\n"
+                        f"📍 Country: `{country}`"
+                    )
+            except Exception:
+                pass
+
+            # ══════════════════════════════════════════════════
+            # PHASE 3: VULNERABILITY SCANNING
+            # ══════════════════════════════════════════════════
+            s.scan_phase = "scanning"
+
+            # Prepare target URLs for scanning
+            scan_targets = []
+            for url in all_urls[:200]:
+                for param in all_params[:20]:
+                    scan_targets.append({"url": url, "param": param})
+            if not scan_targets:
+                # Fallback: use live hosts directly
+                for host in live_hosts[:5]:
+                    scan_targets.append({"url": host, "param": "q"})
+
+            await notify(
+                f"🛡 *Phase 3/5 — Vulnerability Scanning*\n\n"
+                f"📋 Targets: `{len(scan_targets)}` URL+param combos\n\n"
+                "Running these checks:\n"
+                "  🔸 XSS (Reflected, Stored, DOM)\n"
+                "  🔸 SQL Injection (Error, Time, Boolean)\n"
+                "  🔸 SSTI (Jinja2, Twig, Freemarker)\n"
+                "  🔸 SSRF (Cloud metadata endpoints)\n"
+                "  🔸 LFI / Path Traversal\n"
+                "  🔸 Open Redirect\n"
+                "  🔸 IDOR (Insecure Direct Object Reference)\n"
+                "  🔸 API Security (CORS, Secrets, GraphQL)\n"
+            )
+
+            SCANNERS = [
+                ("XSS",           XSSScanner,           "🔸 XSS"),
+                ("SQLi",          SQLIScanner,          "🔸 SQL Injection"),
+                ("SSTI",          SSTIScanner,          "🔸 SSTI"),
+                ("SSRF",          SSRFScanner,          "🔸 SSRF"),
+                ("LFI",           LFIScanner,           "🔸 LFI"),
+                ("OpenRedirect",  OpenRedirectScanner,  "🔸 Open Redirect"),
+                ("IDOR",          IDORScanner,          "🔸 IDOR"),
+                ("API",           APITester,            "🔸 API Security"),
+            ]
+
+            scan_log = []
+            for scanner_name, ScannerClass, label in SCANNERS:
+                s.scan_pct = 30 + (len(scan_log) * 8)
+                try:
+                    scanner = ScannerClass(cfg)
+                    findings = await scanner.scan(scan_targets)
+                    count = len(findings)
+                    all_findings.extend(findings)
+
+                    for f in findings:
+                        scan_db.add_finding(f)
+
+                    status = f"✅ {count} found" if count else "✅ Clean"
+                    scan_log.append(f"  {label}: `{status}`")
+
+                    # Instant alert for high/critical finds
+                    for f in findings:
+                        sev = f.get("severity", "low")
+                        if sev in ("critical", "high"):
+                            emoji = SEV_EMOJI.get(sev, "⚪")
+                            await notify(
+                                f"🚨 *LIVE FINDING: {sev.upper()}*\n\n"
+                                f"{emoji} *Type:* {f.get('type', scanner_name)}\n"
+                                f"🌐 *URL:* `{str(f.get('url',''))[:70]}`\n"
+                                f"🔑 *Parameter:* `{f.get('param', 'N/A')}`\n"
+                                f"💉 *Payload:* `{str(f.get('payload',''))[:80]}`\n"
+                                f"📋 *Details:* {str(f.get('description',''))[:150]}"
+                            )
+                except Exception as e:
+                    scan_log.append(f"  {label}: `⚠ Error ({str(e)[:30]})`")
+                    log.error(f"Scanner {scanner_name} error: {e}")
+
+            await notify(
+                f"✅ *Scanning done!*\n\n"
+                f"*Results per scanner:*\n"
+                + "\n".join(scan_log) +
+                f"\n\n🔎 Raw findings: `{len(all_findings)}`"
+            )
+
+            # ══════════════════════════════════════════════════
+            # PHASE 4: AI ANALYSIS & VALIDATION
+            # ══════════════════════════════════════════════════
+            s.scan_phase = "ai_analysis"
+            s.scan_pct = 80
+
+            if all_findings:
+                await notify(
+                    f"🤖 *Phase 4/5 — AI Analysis & Validation*\n\n"
+                    f"Analysing `{len(all_findings)}` raw findings...\n\n"
+                    "AI will:\n"
+                    "  1️⃣ Score severity (CVSS)\n"
+                    "  2️⃣ Generate proof-of-concept steps\n"
+                    "  3️⃣ Assess business impact\n"
+                    "  4️⃣ Run 7-question validation gate\n"
+                    "  5️⃣ Eliminate false positives\n"
+                    "  6️⃣ Prioritize by exploitability"
+                )
+
+                try:
+                    analyzer = AIAnalyzer(cfg)
+                    analyzed = await analyzer.analyze(all_findings)
+                except Exception as e:
+                    log.error(f"Analyzer error: {e}")
+                    analyzed = all_findings
+
+                try:
+                    validator = AIValidator(cfg)
+                    validated = await validator.validate(analyzed)
+                except Exception as e:
+                    log.error(f"Validator error: {e}")
+                    validated = analyzed
+
+                # Count by severity
+                sev_counts = {}
+                for f in validated:
+                    sev = f.get("severity", "info")
+                    sev_counts[sev] = sev_counts.get(sev, 0) + 1
+
+                validation_msg = (
+                    f"✅ *AI Validation done!*\n\n"
+                    f"📥 Raw findings: `{len(all_findings)}`\n"
+                    f"✅ Validated (real): `{len(validated)}`\n"
+                    f"❌ Rejected (false pos): `{len(all_findings) - len(validated)}`\n\n"
+                    f"*Severity breakdown:*\n"
+                )
+                for sev in ["critical", "high", "medium", "low", "info"]:
+                    count = sev_counts.get(sev, 0)
+                    if count:
+                        validation_msg += f"  {SEV_EMOJI.get(sev)} {sev.title()}: `{count}`\n"
+
+                await notify(validation_msg)
+                all_findings = validated
+            else:
+                await notify(
+                    "🤖 *Phase 4/5 — AI Analysis*\n\n"
+                    "No raw findings to analyze.\n"
+                    "Target appears clean or scan scope was limited."
+                )
+
+            # ══════════════════════════════════════════════════
+            # PHASE 5: REPORT GENERATION
+            # ══════════════════════════════════════════════════
+            s.scan_phase = "reporting"
+            s.scan_pct = 95
+            report_path = ""
+
+            if all_findings:
+                await notify(
+                    f"📝 *Phase 5/5 — Report Generation*\n\n"
+                    f"Building `{s.report_platform}` submission-ready report...\n"
+                    f"Generating PoC steps, remediation advice, CVSS scores..."
+                )
+                try:
+                    reporter = AIReportGenerator(cfg)
+                    report_data = await reporter.generate(
+                        target=target,
+                        findings=all_findings,
+                        subdomains=subdomains,
+                        live_hosts=live_hosts,
+                        tech_stack=tech_stack,
+                        summary={
+                            "total_findings": len(all_findings),
+                            "subdomains_found": len(subdomains),
+                            "live_hosts": len(live_hosts),
+                            "urls_crawled": len(all_urls),
+                        },
+                    )
+                    report_path = report_data.get("path", "")
+                except Exception as e:
+                    log.error(f"Report generation error: {e}")
+
+            # ══════════════════════════════════════════════════
+            # FINAL SUMMARY
+            # ══════════════════════════════════════════════════
+            dur = (datetime.utcnow() - t_start).total_seconds()
+            sev_counts = {}
+            for f in all_findings:
+                sev = f.get("severity", "info")
+                sev_counts[sev] = sev_counts.get(sev, 0) + 1
+
+            summary_msg = (
+                f"🎯 *SCAN COMPLETE — {target}*\n"
+                f"{'━'*35}\n\n"
+                f"⏱ *Duration:* `{dur:.1f}s`\n\n"
+                f"📡 *Reconnaissance:*\n"
+                f"  • Subdomains: `{len(subdomains)}`\n"
+                f"  • Live hosts: `{len(live_hosts)}`\n"
+                f"  • URLs crawled: `{len(all_urls)}`\n"
+                f"  • Parameters: `{len(all_params)}`\n\n"
+                f"🔎 *Findings: `{len(all_findings)}`*\n"
+            )
+            if not all_findings:
+                summary_msg += "  ✅ No confirmed vulnerabilities\n"
+            for sev in ["critical", "high", "medium", "low", "info"]:
+                count = sev_counts.get(sev, 0)
+                if count:
+                    summary_msg += f"  {SEV_EMOJI.get(sev)} {sev.title()}: `{count}`\n"
+
+            summary_msg += f"\n📋 *Platform:* `{s.report_platform}`\n"
+            if report_path:
+                summary_msg += "📄 *Report:* Ready — sending now...\n"
+
+            summary_msg += "\nUse /findings or /report anytime to review."
 
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📊 Findings", callback_data="myfindings"),
-                 InlineKeyboardButton("📄 Report", callback_data="myreport")],
+                [InlineKeyboardButton("📊 View Findings", callback_data="myfindings"),
+                 InlineKeyboardButton("📄 Get Report",    callback_data="myreport")],
             ])
-            await safe_reply(update, msg, reply_markup=kb)
+            await safe_reply(update, summary_msg, reply_markup=kb)
 
-            # ── Alert critical/high ───────────────────────────────────
-            if crit or high:
-                findings = db.get_all_findings(target)
-                urgent = [f for f in findings if f.get("severity") in ("critical", "high")][:5]
-                for f in urgent:
-                    emoji = SEV_EMOJI.get(f.get("severity", "low"), "⚪")
-                    alert = (
-                        f"🚨 *{f.get('severity','').upper()} FINDING*\n\n"
-                        f"{emoji} *Type:* {f.get('type', 'Unknown')}\n"
-                        f"🌐 *URL:* `{str(f.get('url',''))[:80]}`\n"
-                        f"📋 {str(f.get('description',''))[:200]}"
-                    )
-                    await safe_reply(update, alert)
-
-            # ── Auto-send report ──────────────────────────────────────
-            if total > 0:
-                rpath = summary.get("report_path", "")
-                if rpath:
-                    await _send_reports(update, rpath)
+            # Send report file
+            if report_path:
+                await _send_reports(update, report_path)
 
         except asyncio.CancelledError:
             await safe_reply(update, "🛑 *Scan cancelled.*")
