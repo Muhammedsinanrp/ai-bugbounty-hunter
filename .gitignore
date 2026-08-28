@@ -1,0 +1,48 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# Virtual environment
+.venv/
+venv/
+env/
+.env
+
+# Config with secrets (keep config.json template, ignore local overrides)
+config.local.json
+*.env.local
+
+# Findings database (user data)
+findings_db/*.db
+
+# Generated reports (user output)
+reports/output/
+
+# Logs
+logs/*.log
+logs/*.txt
+
+# Wordlists (large, user-specific)
+wordlists/*.txt
+
+# Proxies file (contains sensitive IPs)
+proxies.txt
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# Distribution
+dist/
+build/
+*.egg-info/

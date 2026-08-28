@@ -1,0 +1,70 @@
+{
+    "ai": {
+        "provider": "ollama",
+        "model": "gpt-4o",
+        "api_key": "",
+        "api_base": "",
+        "temperature": 0.1,
+        "max_tokens": 4096,
+        "ollama_model": "llama3",
+        "ollama_url": "http://localhost:11434"
+    },
+    "target": {
+        "domain": "",
+        "scope": [],
+        "exclude": [],
+        "rate_limit": 10,
+        "timeout": 10,
+        "max_depth": 3,
+        "max_pages": 500,
+        "concurrent_requests": 20
+    },
+    "recon": {
+        "subdomains": true,
+        "port_scan": true,
+        "tech_detect": true,
+        "url_crawl": true,
+        "osint": true,
+        "use_passive_only": false,
+        "subfinder_path": "subfinder",
+        "httpx_path": "httpx",
+        "nuclei_path": "nuclei",
+        "katana_path": "katana",
+        "ffuf_path": "ffuf"
+    },
+    "scanners": {
+        "xss": {"enabled": true, "blind_xss_enabled": true, "dom_xss_enabled": true},
+        "sqli": {"enabled": true, "time_based": true, "error_based": true, "boolean_based": true},
+        "ssti": {"enabled": true},
+        "ssrf": {"enabled": true, "oob_enabled": true},
+        "lfi": {"enabled": true},
+        "open_redirect": {"enabled": true},
+        "idor": {"enabled": true, "auto_detect_params": true},
+        "api": {"enabled": true, "graphql_enabled": true},
+        "web3": {"enabled": false, "chain": "ethereum"}
+    },
+    "ai_engine": {
+        "validation_gate_enabled": true,
+        "validation_questions": 7,
+        "auto_prioritize": true,
+        "auto_remediate": false,
+        "min_confidence": 0.6,
+        "enable_payload_generation": true
+    },
+    "reports": {
+        "format": "markdown",
+        "platform": "hackerone",
+        "include_evidence": true,
+        "include_remediation": true,
+        "include_poc": true,
+        "auto_submit": false
+    },
+    "stealth": {
+        "enabled": false,
+        "rotate_user_agents": true,
+        "random_delays": true,
+        "proxy_rotation": false,
+        "proxy_file": "proxies.txt",
+        "respect_robots": true
+    }
+}

@@ -1,0 +1,27 @@
+# AI-BugBounty-Hunter Dependencies
+# Install with: pip install -r requirements.txt
+
+# ── Core Async & Networking ──────────────────────────────────────
+aiohttp>=3.9,<4.0
+dnspython>=2.6,<3.0
+
+# ── AI Integration ───────────────────────────────────────────────
+openai>=1.0
+anthropic>=0.30
+
+# ── Web Scraping & Parsing ───────────────────────────────────────
+beautifulsoup4>=4.12,<5.0
+lxml>=5.0
+requests>=2.31
+
+# ── Terminal UI ──────────────────────────────────────────────────
+rich>=13.0
+colorama>=0.4
+tqdm>=4.66
+
+# ── Data & Utils ─────────────────────────────────────────────────
+ujson>=5.9
+
+# ── Web3 (optional — uncomment if needed) ───────────────────────
+# web3>=6.0
+# eth-brownie>=1.20
