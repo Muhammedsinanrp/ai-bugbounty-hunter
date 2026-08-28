@@ -1,42 +1,38 @@
 #!/usr/bin/env python3
 """
-AI-BugBounty-Hunter — Telegram Bot Integration
-Full-control Telegram bot: start scans, live progress, findings alerts, report delivery.
+AI-BugBounty-Hunter — Telegram Bot (Multi-User, Cross-Platform)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Supports unlimited simultaneous users — each user has their own:
+  - Independent scan session
+  - Live progress tracking
+  - Findings history
+  - Configuration (AI provider, model, platform)
 
-Commands:
-  /start       — Welcome + help
-  /scan <domain> — Start full pipeline scan
-  /quick <domain> — Quick passive recon only
-  /recon <domain> — Recon only (no scanning)
-  /status      — Show current scan status
-  /findings    — List latest findings from DB
-  /report      — Send latest report file
-  /cancel      — Cancel running scan
-  /config      — Show current config
-  /setprovider <openai|anthropic|groq|ollama> — Switch AI provider
-  /setkey <api_key> — Set AI API key
-  /help        — Show all commands
+Works on: Windows, Linux, macOS
 """
-import asyncio
-import json
-import os
-import sys
-import traceback
 
-# Fix Windows console encoding (must be before any output)
+# ── Cross-platform encoding fix (MUST be first) ──────────────────────────────
+import sys, os
 if sys.platform == "win32":
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
-    os.environ["PYTHONIOENCODING"] = "utf-8"
+os.environ.setdefault("PYTHONUTF8", "1")
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
+# ── Stdlib ───────────────────────────────────────────────────────────────────
+import asyncio
+import json
+import logging
+import traceback
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any
+from dataclasses import dataclass, field
 
-# Telegram
+# ── Telegram ──────────────────────────────────────────────────────────────────
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    BotCommand, Document
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -44,281 +40,359 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-# Project modules
+# ── Project ───────────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
 from core.config import Config
-from core.agent import AIAgent
 from core.database import FindingsDB
-from core.logger import Logger
+
+# ── Logging (plain, cross-platform) ──────────────────────────────────────────
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("logs/bot.log", encoding="utf-8"),
+    ]
+)
+log = logging.getLogger("BugBot")
+
+# Create logs dir
+Path("logs").mkdir(exist_ok=True)
+Path("reports/output").mkdir(parents=True, exist_ok=True)
+Path("findings_db").mkdir(exist_ok=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-user session state
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class UserSession:
+    user_id: int
+    username: str = ""
+    # Scan state
+    active_task: Optional[asyncio.Task] = None
+    scan_phase: str = "idle"
+    scan_pct: int = 0
+    scan_target: str = ""
+    # Per-user config overrides
+    ai_provider: str = "ollama"
+    ai_model: str = "llama3"
+    report_platform: str = "hackerone"
+    api_key: str = ""
+    # Stats
+    total_scans: int = 0
+    last_scan: str = ""
+
+    def is_scanning(self) -> bool:
+        return self.active_task is not None and not self.active_task.done()
+
+    def get_config(self) -> Config:
+        """Build a config object for this user."""
+        cfg = Config()
+        cfg.data["ai"]["provider"] = self.ai_provider
+        cfg.data["ai"]["model"] = self.ai_model
+        cfg.data["reports"]["platform"] = self.report_platform
+        if self.api_key:
+            cfg.data["ai"]["api_key"] = self.api_key
+        return cfg
 
 
-# ── Globals ──────────────────────────────────────────────────────────────────
-logger = Logger("TelegramBot")
-config = Config()
+# Global session store: user_id → UserSession
+SESSIONS: Dict[int, UserSession] = {}
+
+# Load base config
+BASE_CONFIG = Config()
 db = FindingsDB()
-active_scan: Optional[asyncio.Task] = None
-scan_status: Dict[str, Any] = {"phase": "idle", "percentage": 0, "target": ""}
 
-SEVERITY_EMOJI = {
-    "critical": "🔴", "high": "🟠", "medium": "🟡",
-    "low": "🔵", "info": "⚪"
-}
-
-# Authorized user IDs (set in config or TELEGRAM_ALLOWED_USERS env var)
+# Authorized users (empty = allow all)
 ALLOWED_USERS: list = []
 
+SEV_EMOJI = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵", "info": "⚪"}
 
-# ── Authorization ─────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def get_session(user: Any) -> UserSession:
+    """Get or create a session for a user."""
+    uid = user.id
+    if uid not in SESSIONS:
+        SESSIONS[uid] = UserSession(
+            user_id=uid,
+            username=user.username or user.first_name or str(uid),
+            ai_provider=BASE_CONFIG.get("ai", "provider", default="ollama"),
+            ai_model=BASE_CONFIG.get("ai", "model", default="llama3"),
+            report_platform=BASE_CONFIG.get("reports", "platform", default="hackerone"),
+        )
+    return SESSIONS[uid]
+
+
 def is_authorized(user_id: int) -> bool:
-    """Check if user is allowed to use the bot."""
-    if not ALLOWED_USERS:
-        return True  # Open to all if no restrictions set
-    return user_id in ALLOWED_USERS
+    return not ALLOWED_USERS or user_id in ALLOWED_USERS
 
 
-def auth_required(func):
-    """Decorator to enforce authorization."""
+def progress_bar(pct: int) -> str:
+    filled = "█" * (pct // 5)
+    empty = "░" * (20 - pct // 5)
+    return f"`[{filled}{empty}] {pct}%`"
+
+
+def escape_md(text: str) -> str:
+    """Escape special MarkdownV2 chars."""
+    for ch in r"_*[]()~`>#+-=|{}.!":
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
+async def safe_reply(update: Update, text: str, **kwargs):
+    """Reply with Markdown, fallback to plain text on error."""
+    try:
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, **kwargs)
+    except Exception:
+        try:
+            plain = text.replace("*", "").replace("`", "").replace("_", "")
+            await update.message.reply_text(plain, **kwargs)
+        except Exception as e:
+            log.error(f"Failed to send message: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Authorization decorator
+# ─────────────────────────────────────────────────────────────────────────────
+def auth(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if not is_authorized(user_id):
-            await update.message.reply_text(
-                "⛔ *Access Denied*\n\nYou are not authorized to use this bot.",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-            logger.warning(f"Unauthorized access attempt from user {user_id}")
+        if not update.effective_user:
+            return
+        uid = update.effective_user.id
+        if not is_authorized(uid):
+            await safe_reply(update, "⛔ *Access Denied.* You are not authorized to use this bot.")
+            log.warning(f"Unauthorized: user {uid}")
             return
         return await func(update, context)
+    wrapper.__name__ = func.__name__
     return wrapper
 
 
-# ── /start ────────────────────────────────────────────────────────────────────
-@auth_required
+# ─────────────────────────────────────────────────────────────────────────────
+# /start
+# ─────────────────────────────────────────────────────────────────────────────
+@auth
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+    s = get_session(update.effective_user)
     text = (
-        f"👋 *Welcome, {user.first_name}!*\n\n"
-        "🎯 *AI\\-BugBounty\\-Hunter Bot* — Your AI\\-powered bug bounty assistant\\.\n\n"
-        "I can:\n"
-        "• 🔍 Run full vulnerability scans\n"
-        "• 📡 Do passive recon \\(safe, no active scanning\\)\n"
-        "• 🤖 Use AI to analyze \\& validate findings\n"
-        "• 📝 Generate submission\\-ready reports\n"
-        "• 📤 Send you reports as files\n\n"
-        "Use /help to see all available commands\\."
+        f"👋 *Welcome, {update.effective_user.first_name}!*\n\n"
+        "🎯 *AI-BugBounty-Hunter Bot*\n"
+        "AI-powered bug bounty automation platform.\n\n"
+        "*What I can do:*\n"
+        "• 🔍 Full vulnerability pipeline scans\n"
+        "• ⚡ Quick passive recon (no active traffic)\n"
+        "• 🤖 AI-driven finding analysis & validation\n"
+        "• 📄 Generate platform-ready reports\n"
+        "• 📤 Send reports as files directly to you\n\n"
+        f"*Your session:* `{s.username}` | Provider: `{s.ai_provider}`\n\n"
+        "Use /help to see all commands."
     )
-    keyboard = InlineKeyboardMarkup([
+    kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📖 Help", callback_data="help"),
-         InlineKeyboardButton("⚙️ Config", callback_data="config")],
-        [InlineKeyboardButton("📊 Findings", callback_data="findings"),
-         InlineKeyboardButton("📄 Report", callback_data="report")],
+         InlineKeyboardButton("⚙️ My Config", callback_data="myconfig")],
+        [InlineKeyboardButton("📊 My Findings", callback_data="myfindings"),
+         InlineKeyboardButton("📄 Get Report", callback_data="myreport")],
     ])
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2,
-                                    reply_markup=keyboard)
+    await safe_reply(update, text, reply_markup=kb)
 
 
-# ── /help ─────────────────────────────────────────────────────────────────────
-@auth_required
+# ─────────────────────────────────────────────────────────────────────────────
+# /help
+# ─────────────────────────────────────────────────────────────────────────────
+@auth
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "🛠 *Available Commands*\n\n"
+        "🛠 *Commands*\n\n"
         "*Scanning:*\n"
-        "`/scan example.com` — Full AI pipeline scan\n"
-        "`/quick example.com` — Quick passive recon only\n"
-        "`/recon example.com` — Recon only (no active scanning)\n"
-        "`/cancel` — Cancel the running scan\n\n"
+        "`/scan <domain>` — Full AI pipeline scan\n"
+        "`/quick <domain>` — Passive recon (safe)\n"
+        "`/status` — Your current scan progress\n"
+        "`/cancel` — Cancel your running scan\n\n"
         "*Results:*\n"
-        "`/status` — Current scan status & progress\n"
-        "`/findings` — View latest findings\n"
+        "`/findings` — Your latest findings\n"
         "`/findings critical` — Filter by severity\n"
-        "`/report` — Receive the latest report file\n\n"
-        "*Configuration:*\n"
-        "`/config` — Show current settings\n"
-        "`/setprovider openai` — Switch AI provider\n"
-        "`/setkey sk-your-key` — Set AI API key\n"
-        "`/setmodel gpt-4o` — Set AI model\n\n"
+        "`/findings <domain>` — Filter by target\n"
+        "`/report` — Get latest report as file\n"
+        "`/report <domain>` — Report for specific target\n\n"
+        "*Your Config:*\n"
+        "`/myconfig` — View your settings\n"
+        "`/setprovider <openai|anthropic|groq|ollama>`\n"
+        "`/setmodel <model-name>`\n"
+        "`/setkey <api-key>` — Set your API key\n"
+        "`/setplatform <hackerone|bugcrowd|intigriti|immunefi>`\n\n"
         "*Info:*\n"
+        "`/mystats` — Your scan statistics\n"
         "`/start` — Welcome screen\n"
-        "`/help` — This help message\n\n"
+        "`/help` — This message\n\n"
         "⚠️ *Only scan targets you have permission to test!*"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await safe_reply(update, text)
 
 
-# ── /scan ─────────────────────────────────────────────────────────────────────
-@auth_required
+# ─────────────────────────────────────────────────────────────────────────────
+# /scan — Full pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+@auth
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global active_scan, scan_status
+    s = get_session(update.effective_user)
 
     if not context.args:
-        await update.message.reply_text(
-            "❌ Please provide a target domain.\n\nUsage: `/scan example.com`",
-            parse_mode=ParseMode.MARKDOWN,
+        await safe_reply(update, "❌ Usage: `/scan example.com`")
+        return
+
+    if s.is_scanning():
+        await safe_reply(
+            update,
+            f"⏳ *You already have a scan running* for `{s.scan_target}`.\n"
+            "Use /status to check progress or /cancel to stop it."
         )
         return
 
-    if active_scan and not active_scan.done():
-        await update.message.reply_text(
-            f"⏳ A scan is already running for `{scan_status['target']}`.\n"
-            "Use /status to check progress or /cancel to stop it.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
+    target = context.args[0].strip().lower().replace("https://", "").replace("http://", "").rstrip("/")
+    s.scan_target = target
+    s.scan_phase = "starting"
+    s.scan_pct = 0
+    s.total_scans += 1
+    s.last_scan = datetime.utcnow().isoformat()
 
-    target = context.args[0].strip().lower().replace("https://", "").replace("http://", "")
-    scan_status = {"phase": "starting", "percentage": 0, "target": target}
-
-    msg = await update.message.reply_text(
+    await safe_reply(
+        update,
         f"🚀 *Starting full scan for:* `{target}`\n\n"
-        f"🤖 AI Provider: `{config.ai_provider}`\n"
-        f"📋 Platform: `{config.get('reports', 'platform', default='hackerone')}`\n\n"
-        "This may take several minutes\\. I'll send updates as we go\\.",
-        parse_mode=ParseMode.MARKDOWN_V2,
+        f"🤖 AI Provider: `{s.ai_provider}` | Model: `{s.ai_model}`\n"
+        f"📋 Platform: `{s.report_platform}`\n\n"
+        "_This may take several minutes. I'll update you at each phase._"
     )
-
-    async def progress_callback(phase: str, percentage: int):
-        scan_status["phase"] = phase
-        scan_status["percentage"] = percentage
 
     async def run_scan():
         try:
-            agent = AIAgent(config)
+            from core.agent import AIAgent
+            cfg = s.get_config()
+            cfg.set_target(target)
+            agent = AIAgent(cfg)
 
-            def on_progress(phase: str, percentage: int):
-                scan_status["phase"] = phase
-                scan_status["percentage"] = percentage
+            def on_progress(phase: str, pct: int):
+                s.scan_phase = phase
+                s.scan_pct = pct
 
             agent.register_progress_callback(on_progress)
 
-            # Send phase update messages
-            phase_msgs = {
-                "recon": "🔭 *Phase 1/5: Reconnaissance*\nDiscovering subdomains...",
-                "enumeration": "📡 *Phase 2/5: Surface Enumeration*\nProbing live hosts & crawling URLs...",
-                "scanning": "🛡️ *Phase 3/5: Vulnerability Scanning*\nRunning XSS, SQLi, SSRF, LFI & more...",
-                "ai_analysis": "🤖 *Phase 4/5: AI Analysis*\nValidating findings & scoring severity...",
-                "reporting": "📝 *Phase 5/5: Report Generation*\nCreating submission-ready reports...",
+            PHASE_MSGS = {
+                "recon":       "🔭 *Phase 1/5 — Reconnaissance*\nDiscovering subdomains...",
+                "enumeration": "📡 *Phase 2/5 — Surface Enumeration*\nProbing live hosts & crawling URLs...",
+                "scanning":    "🛡 *Phase 3/5 — Vulnerability Scanning*\nRunning XSS, SQLi, SSRF, LFI & more...",
+                "ai_analysis": "🤖 *Phase 4/5 — AI Analysis*\nValidating findings through AI gate...",
+                "reporting":   "📝 *Phase 5/5 — Report Generation*\nBuilding submission-ready reports...",
             }
+            last_phase = ""
 
             async def phase_notifier():
-                last_phase = ""
-                while not active_scan.done():
-                    current = scan_status.get("phase", "")
-                    if current != last_phase and current in phase_msgs:
-                        await update.message.reply_text(
-                            phase_msgs[current],
-                            parse_mode=ParseMode.MARKDOWN,
-                        )
-                        last_phase = current
-                    await asyncio.sleep(3)
+                nonlocal last_phase
+                while True:
+                    await asyncio.sleep(4)
+                    cur = s.scan_phase
+                    if cur != last_phase and cur in PHASE_MSGS:
+                        await safe_reply(update, PHASE_MSGS[cur])
+                        last_phase = cur
 
             notifier = asyncio.create_task(phase_notifier())
             summary = await agent.run_full_pipeline(target)
             notifier.cancel()
 
-            # ── Send Summary ──────────────────────────────────────────────
+            # ── Results ──────────────────────────────────────────────
             total = summary.get("findings_total", 0)
-            crit = summary.get("critical_findings", 0)
-            high = summary.get("high_findings", 0)
-            med = summary.get("medium_findings", 0)
-            low = summary.get("low_findings", 0)
-            dur = summary.get("duration_seconds", 0)
+            crit  = summary.get("critical_findings", 0)
+            high  = summary.get("high_findings", 0)
+            med   = summary.get("medium_findings", 0)
+            low_  = summary.get("low_findings", 0)
+            dur   = summary.get("duration_seconds", 0)
 
-            result_text = (
+            msg = (
                 f"✅ *Scan Complete!*\n\n"
                 f"🎯 Target: `{target}`\n"
                 f"⏱ Duration: `{dur:.1f}s`\n\n"
-                f"📊 *Recon Stats:*\n"
+                f"📊 *Recon:*\n"
                 f"• Subdomains: `{summary.get('subdomains_found', 0)}`\n"
-                f"• Live Hosts: `{summary.get('live_hosts', 0)}`\n"
-                f"• URLs Crawled: `{summary.get('urls_crawled', 0)}`\n"
+                f"• Live hosts: `{summary.get('live_hosts', 0)}`\n"
+                f"• URLs crawled: `{summary.get('urls_crawled', 0)}`\n"
                 f"• Parameters: `{summary.get('parameters_discovered', 0)}`\n\n"
                 f"🔎 *Findings: {total}*\n"
             )
-            if crit:
-                result_text += f"  🔴 Critical: `{crit}`\n"
-            if high:
-                result_text += f"  🟠 High:     `{high}`\n"
-            if med:
-                result_text += f"  🟡 Medium:   `{med}`\n"
-            if low:
-                result_text += f"  🔵 Low:      `{low}`\n"
-            if not total:
-                result_text += "  ✅ No vulnerabilities found\n"
+            if crit: msg += f"  🔴 Critical: `{crit}`\n"
+            if high: msg += f"  🟠 High:     `{high}`\n"
+            if med:  msg += f"  🟡 Medium:   `{med}`\n"
+            if low_: msg += f"  🔵 Low:      `{low_}`\n"
+            if not total: msg += "  ✅ No vulnerabilities found\n"
+            msg += "\nUse /findings or /report to review results."
 
-            result_text += "\nUse /findings to view details or /report to receive the file."
-
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📊 View Findings", callback_data="findings"),
-                 InlineKeyboardButton("📄 Get Report", callback_data="report")],
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📊 Findings", callback_data="myfindings"),
+                 InlineKeyboardButton("📄 Report", callback_data="myreport")],
             ])
-            await update.message.reply_text(
-                result_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
-            )
+            await safe_reply(update, msg, reply_markup=kb)
 
-            # ── Alert critical/high findings ──────────────────────────────
+            # ── Alert critical/high ───────────────────────────────────
             if crit or high:
                 findings = db.get_all_findings(target)
-                urgent = [
-                    f for f in findings
-                    if f.get("severity") in ("critical", "high")
-                ][:5]
-
+                urgent = [f for f in findings if f.get("severity") in ("critical", "high")][:5]
                 for f in urgent:
-                    emoji = SEVERITY_EMOJI.get(f.get("severity", "low"), "⚪")
+                    emoji = SEV_EMOJI.get(f.get("severity", "low"), "⚪")
                     alert = (
-                        f"🚨 *{f.get('severity', '').upper()} FINDING*\n\n"
+                        f"🚨 *{f.get('severity','').upper()} FINDING*\n\n"
                         f"{emoji} *Type:* {f.get('type', 'Unknown')}\n"
-                        f"🌐 *URL:* `{f.get('url', 'N/A')[:80]}`\n"
-                        f"🔢 *CVSS:* `{f.get('cvss', 'N/A')}`\n"
-                        f"📋 *Description:* {str(f.get('description', 'N/A'))[:200]}"
+                        f"🌐 *URL:* `{str(f.get('url',''))[:80]}`\n"
+                        f"📋 {str(f.get('description',''))[:200]}"
                     )
-                    await update.message.reply_text(alert, parse_mode=ParseMode.MARKDOWN)
+                    await safe_reply(update, alert)
 
-            # ── Auto-send report file if findings exist ───────────────────
+            # ── Auto-send report ──────────────────────────────────────
             if total > 0:
-                report_path = summary.get("report_path", "")
-                if report_path:
-                    await _send_report_files(update, report_path)
+                rpath = summary.get("report_path", "")
+                if rpath:
+                    await _send_reports(update, rpath)
 
         except asyncio.CancelledError:
-            await update.message.reply_text("⚠️ Scan was cancelled.")
+            await safe_reply(update, "🛑 *Scan cancelled.*")
         except Exception as e:
-            logger.error(f"Scan failed: {e}")
-            await update.message.reply_text(
-                f"❌ *Scan failed:* `{str(e)[:500]}`",
-                parse_mode=ParseMode.MARKDOWN,
-            )
+            log.error(f"Scan error for user {s.user_id}: {e}\n{traceback.format_exc()}")
+            await safe_reply(update, f"❌ *Scan failed:* `{str(e)[:300]}`")
         finally:
-            scan_status["phase"] = "idle"
-            scan_status["percentage"] = 0
+            s.scan_phase = "idle"
+            s.scan_pct = 0
+            s.active_task = None
 
-    active_scan = asyncio.create_task(run_scan())
+    s.active_task = asyncio.create_task(run_scan())
 
 
-# ── /quick ────────────────────────────────────────────────────────────────────
-@auth_required
+# ─────────────────────────────────────────────────────────────────────────────
+# /quick — Passive recon only
+# ─────────────────────────────────────────────────────────────────────────────
+@auth
 async def cmd_quick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global active_scan, scan_status
+    s = get_session(update.effective_user)
 
     if not context.args:
-        await update.message.reply_text(
-            "❌ Usage: `/quick example.com`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await safe_reply(update, "❌ Usage: `/quick example.com`")
         return
 
-    if active_scan and not active_scan.done():
-        await update.message.reply_text(
-            f"⏳ Scan already running for `{scan_status['target']}`.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+    if s.is_scanning():
+        await safe_reply(update, f"⏳ Scan running for `{s.scan_target}`. Use /cancel first.")
         return
 
-    target = context.args[0].strip().lower().replace("https://", "").replace("http://", "")
-    scan_status = {"phase": "recon", "percentage": 5, "target": target}
+    target = context.args[0].strip().lower().replace("https://", "").replace("http://", "").rstrip("/")
+    s.scan_target = target
+    s.scan_phase = "recon"
+    s.total_scans += 1
+    s.last_scan = datetime.utcnow().isoformat()
 
-    await update.message.reply_text(
-        f"⚡ *Quick passive recon for:* `{target}`\n\nNo active scanning — safe for all targets.",
-        parse_mode=ParseMode.MARKDOWN,
+    await safe_reply(
+        update,
+        f"⚡ *Quick passive recon for:* `{target}`\n\n"
+        "_No active scanning — safe for all targets._"
     )
 
     async def run_quick():
@@ -327,84 +401,81 @@ async def cmd_quick(update: Update, context: ContextTypes.DEFAULT_TYPE):
             from recon.port_scanner import PortScanner
             from recon.tech_detect import TechDetector
 
-            enum = SubdomainEnumerator(config)
+            cfg = s.get_config()
+
+            s.scan_phase = "recon"
+            enum = SubdomainEnumerator(cfg)
             subdomains = await enum.discover(target)
 
-            scan_status["phase"] = "enumeration"
-            scanner = PortScanner(config)
+            s.scan_phase = "enumeration"
+            scanner = PortScanner(cfg)
             live = await scanner.scan(subdomains)
 
-            scan_status["phase"] = "tech_detect"
-            tech = TechDetector(config)
+            s.scan_phase = "tech"
+            tech = TechDetector(cfg)
             tech_stack = await tech.fingerprint(live)
-
             total_techs = sum(len(v) for v in tech_stack.values())
-            tech_preview = []
-            for host, techs in list(tech_stack.items())[:3]:
-                tech_preview.append(f"• `{host}`: {', '.join(techs[:4])}")
 
-            text = (
+            msg = (
                 f"✅ *Quick Recon Complete!*\n\n"
                 f"🎯 Target: `{target}`\n"
                 f"🔍 Subdomains: `{len(subdomains)}`\n"
                 f"🌐 Live Hosts: `{len(live)}`\n"
-                f"⚙️ Technologies: `{total_techs}`\n\n"
+                f"⚙️ Technologies: `{total_techs}`\n"
             )
-
             if subdomains:
-                top_subs = subdomains[:10]
-                text += "*Top Subdomains:*\n"
-                text += "\n".join(f"• `{s}`" for s in top_subs)
+                top = subdomains[:10]
+                msg += "\n*Top Subdomains:*\n" + "\n".join(f"• `{s_}`" for s_ in top)
                 if len(subdomains) > 10:
-                    text += f"\n_...and {len(subdomains)-10} more_"
-                text += "\n\n"
+                    msg += f"\n_...and {len(subdomains)-10} more_"
 
-            if tech_preview:
-                text += "*Tech Stack:*\n"
-                text += "\n".join(tech_preview)
+            if tech_stack:
+                msg += "\n\n*Tech Stack:*\n"
+                for host, techs in list(tech_stack.items())[:4]:
+                    short_host = host.replace("https://","").replace("http://","")[:30]
+                    msg += f"• `{short_host}`: {', '.join(techs[:4])}\n"
 
-            text += "\n\nRun `/scan " + target + "` for full vulnerability scanning."
-            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+            msg += f"\n\n_Run_ `/scan {target}` _for full vulnerability scanning._"
+            await safe_reply(update, msg)
 
         except asyncio.CancelledError:
-            await update.message.reply_text("⚠️ Recon cancelled.")
+            await safe_reply(update, "🛑 Recon cancelled.")
         except Exception as e:
-            await update.message.reply_text(f"❌ Recon failed: `{e}`", parse_mode=ParseMode.MARKDOWN)
+            log.error(f"Quick recon error: {e}")
+            await safe_reply(update, f"❌ Recon failed: `{str(e)[:200]}`")
         finally:
-            scan_status["phase"] = "idle"
+            s.scan_phase = "idle"
+            s.active_task = None
 
-    active_scan = asyncio.create_task(run_quick())
+    s.active_task = asyncio.create_task(run_quick())
 
 
-# ── /status ───────────────────────────────────────────────────────────────────
-@auth_required
+# ─────────────────────────────────────────────────────────────────────────────
+# /status
+# ─────────────────────────────────────────────────────────────────────────────
+@auth
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global active_scan, scan_status
+    s = get_session(update.effective_user)
 
-    if active_scan and not active_scan.done():
-        phase = scan_status.get("phase", "unknown")
-        pct = scan_status.get("percentage", 0)
-        target = scan_status.get("target", "unknown")
-
-        # Progress bar
-        filled = "█" * (pct // 5)
-        empty = "░" * (20 - pct // 5)
-        bar = f"`[{filled}{empty}] {pct}%`"
-
+    if s.is_scanning():
         phase_names = {
-            "recon": "🔭 Reconnaissance",
+            "recon":       "🔭 Reconnaissance",
             "enumeration": "📡 Surface Enumeration",
-            "scanning": "🛡️ Vulnerability Scanning",
+            "scanning":    "🛡 Vulnerability Scanning",
             "ai_analysis": "🤖 AI Analysis",
-            "reporting": "📝 Report Generation",
+            "reporting":   "📝 Report Generation",
+            "tech":        "⚙️ Tech Detection",
         }
+        phase_label = phase_names.get(s.scan_phase, s.scan_phase.title())
+        bar = progress_bar(s.scan_pct)
 
         text = (
             f"⏳ *Scan In Progress*\n\n"
-            f"🎯 Target: `{target}`\n"
-            f"📍 Phase: {phase_names.get(phase, phase.title())}\n"
+            f"👤 User: `{s.username}`\n"
+            f"🎯 Target: `{s.scan_target}`\n"
+            f"📍 Phase: {phase_label}\n"
             f"📊 Progress: {bar}\n\n"
-            "Use /cancel to stop the scan."
+            "_Use /cancel to stop._"
         )
     else:
         stats = db.get_stats()
@@ -412,34 +483,38 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         by_sev = stats.get("by_severity", {})
 
         text = (
-            "💤 *No scan running*\n\n"
-            f"📦 *Total findings in DB:* `{total}`\n"
+            f"💤 *No scan running*\n\n"
+            f"👤 User: `{s.username}`\n"
+            f"🔢 Total scans done: `{s.total_scans}`\n"
+            f"📦 Total findings in DB: `{total}`\n"
         )
         for sev in ["critical", "high", "medium", "low", "info"]:
             count = by_sev.get(sev, 0)
             if count:
-                text += f"  {SEVERITY_EMOJI.get(sev, '⚪')} {sev.title()}: `{count}`\n"
+                text += f"  {SEV_EMOJI.get(sev)} {sev.title()}: `{count}`\n"
+        text += "\nStart a scan: `/scan example.com`"
 
-        text += "\nStart a scan with `/scan example.com`"
-
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await safe_reply(update, text)
 
 
-# ── /cancel ───────────────────────────────────────────────────────────────────
-@auth_required
+# ─────────────────────────────────────────────────────────────────────────────
+# /cancel
+# ─────────────────────────────────────────────────────────────────────────────
+@auth
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global active_scan
-
-    if active_scan and not active_scan.done():
-        active_scan.cancel()
-        scan_status["phase"] = "idle"
-        await update.message.reply_text("🛑 *Scan cancelled.*", parse_mode=ParseMode.MARKDOWN)
+    s = get_session(update.effective_user)
+    if s.is_scanning():
+        s.active_task.cancel()
+        s.scan_phase = "idle"
+        await safe_reply(update, "🛑 *Scan cancelled.*")
     else:
-        await update.message.reply_text("ℹ️ No scan is currently running.")
+        await safe_reply(update, "ℹ️ No scan is currently running for you.")
 
 
-# ── /findings ─────────────────────────────────────────────────────────────────
-@auth_required
+# ─────────────────────────────────────────────────────────────────────────────
+# /findings
+# ─────────────────────────────────────────────────────────────────────────────
+@auth
 async def cmd_findings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     severity_filter = None
     target_filter = None
@@ -450,100 +525,88 @@ async def cmd_findings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             target_filter = arg
 
-    findings = db.get_all_findings(
-        target=target_filter,
-        severity=severity_filter,
-    )
+    findings = db.get_all_findings(target=target_filter, severity=severity_filter)
 
     if not findings:
         msg = "📭 *No findings"
-        if severity_filter:
-            msg += f" with severity `{severity_filter}`"
-        if target_filter:
-            msg += f" for `{target_filter}`"
-        msg += " in the database.*\n\nRun `/scan example.com` to start scanning."
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        if severity_filter: msg += f" with severity `{severity_filter}`"
+        if target_filter:   msg += f" for `{target_filter}`"
+        msg += "*\n\nRun `/scan example.com` to start."
+        await safe_reply(update, msg)
         return
 
     # Group by severity
     by_sev: Dict[str, list] = {}
-    for f in findings[:30]:
+    for f in findings[:50]:
         sev = f.get("severity", "info")
         by_sev.setdefault(sev, []).append(f)
 
-    text = f"📊 *Findings ({len(findings)} total)*"
-    if severity_filter:
-        text += f" — filtered: `{severity_filter}`"
-    if target_filter:
-        text += f" — target: `{target_filter}`"
-    text += "\n\n"
+    msg = f"📊 *Findings ({len(findings)} total)*"
+    if severity_filter: msg += f" — `{severity_filter}`"
+    if target_filter:   msg += f" — `{target_filter}`"
+    msg += "\n\n"
 
     for sev in ["critical", "high", "medium", "low", "info"]:
         items = by_sev.get(sev, [])
         if not items:
             continue
-        emoji = SEVERITY_EMOJI.get(sev, "⚪")
-        text += f"{emoji} *{sev.upper()}* ({len(items)})\n"
+        emoji = SEV_EMOJI.get(sev, "⚪")
+        msg += f"{emoji} *{sev.upper()}* ({len(items)})\n"
         for f in items[:3]:
-            url = f.get("url", "N/A")[:60]
-            vtype = f.get("type", "Unknown")[:30]
-            text += f"  • {vtype} — `{url}`\n"
+            url   = str(f.get("url", "N/A"))[:55]
+            vtype = str(f.get("type", "Unknown"))[:28]
+            msg += f"  • {vtype} — `{url}`\n"
         if len(items) > 3:
-            text += f"  _...+{len(items)-3} more_\n"
-        text += "\n"
+            msg += f"  _+{len(items)-3} more_\n"
+        msg += "\n"
 
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await safe_reply(update, msg)
 
 
-# ── /report ───────────────────────────────────────────────────────────────────
-@auth_required
+# ─────────────────────────────────────────────────────────────────────────────
+# /report
+# ─────────────────────────────────────────────────────────────────────────────
+@auth
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target = context.args[0] if context.args else None
-    report_dir = Path("reports/output")
+    report_base = Path("reports/output")
 
-    if not report_dir.exists():
-        await update.message.reply_text("📭 No reports generated yet. Run `/scan example.com` first.")
+    if not report_base.exists():
+        await safe_reply(update, "📭 No reports yet. Run `/scan example.com` first.")
         return
 
-    # Find the most recent report directory
     subdirs = sorted(
-        [d for d in report_dir.iterdir() if d.is_dir()],
+        [d for d in report_base.iterdir() if d.is_dir()],
         key=lambda d: d.stat().st_mtime,
         reverse=True,
     )
 
     if target:
-        safe_target = target.replace(".", "_").replace("/", "_")
-        subdirs = [d for d in subdirs if safe_target in d.name] or subdirs
+        safe_t = target.replace(".", "_").replace("/", "_")
+        filtered = [d for d in subdirs if safe_t in d.name]
+        subdirs = filtered or subdirs
 
     if not subdirs:
-        await update.message.reply_text("📭 No report directories found.")
+        await safe_reply(update, "📭 No report directories found.")
         return
 
-    report_path = str(subdirs[0])
-    await update.message.reply_text(
-        f"📄 Sending latest report from: `{subdirs[0].name}`",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    await _send_report_files(update, report_path)
+    await safe_reply(update, f"📤 Sending report for: `{subdirs[0].name}`")
+    await _send_reports(update, str(subdirs[0]))
 
 
-async def _send_report_files(update: Update, report_dir: str):
-    """Send all .md report files from a directory."""
+async def _send_reports(update: Update, report_dir: str):
+    """Send all markdown report files from a directory."""
     path = Path(report_dir)
     if not path.exists():
-        await update.message.reply_text("📭 Report directory not found.")
+        await safe_reply(update, "📭 Report directory not found.")
         return
 
     md_files = sorted(path.glob("*.md"), key=lambda f: f.stat().st_size, reverse=True)
-
     if not md_files:
-        await update.message.reply_text("📭 No report files found.")
+        await safe_reply(update, "📭 No report files found.")
         return
 
-    await update.message.reply_text(f"📤 Sending `{len(md_files)}` report file(s)...",
-                                    parse_mode=ParseMode.MARKDOWN)
-
+    await safe_reply(update, f"📄 Sending `{len(md_files)}` report file(s)...")
     for fpath in md_files:
         try:
             with open(fpath, "rb") as f:
@@ -554,251 +617,252 @@ async def _send_report_files(update: Update, report_dir: str):
                     parse_mode=ParseMode.MARKDOWN,
                 )
         except Exception as e:
-            await update.message.reply_text(f"⚠️ Could not send `{fpath.name}`: {e}",
-                                            parse_mode=ParseMode.MARKDOWN)
+            log.error(f"Failed to send report {fpath.name}: {e}")
+            await safe_reply(update, f"⚠️ Could not send `{fpath.name}`")
 
 
-# ── /config ───────────────────────────────────────────────────────────────────
-@auth_required
-async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ─────────────────────────────────────────────────────────────────────────────
+# /myconfig
+# ─────────────────────────────────────────────────────────────────────────────
+@auth
+async def cmd_myconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s = get_session(update.effective_user)
     text = (
-        "⚙️ *Current Configuration*\n\n"
-        f"🤖 *AI Provider:* `{config.get('ai', 'provider', default='ollama')}`\n"
-        f"📦 *AI Model:* `{config.get('ai', 'model', default='N/A')}`\n"
-        f"🌡️ *Temperature:* `{config.get('ai', 'temperature', default=0.1)}`\n"
-        f"🔑 *API Key:* `{'Set ✓' if config.get('ai', 'api_key') else 'Not set ✗'}`\n\n"
-        f"🛡️ *Validation Gate:* `{'On' if config.get('ai_engine', 'validation_gate_enabled', default=True) else 'Off'}`\n"
-        f"📋 *Report Platform:* `{config.get('reports', 'platform', default='hackerone')}`\n"
-        f"⚡ *Rate Limit:* `{config.get('target', 'rate_limit', default=10)} req/s`\n"
-        f"🔒 *Stealth Mode:* `{'On' if config.get('stealth', 'enabled', default=False) else 'Off'}`\n\n"
-        "*Active Scanners:*\n"
+        f"⚙️ *Your Configuration*\n\n"
+        f"👤 User: `{s.username}`\n"
+        f"🤖 AI Provider: `{s.ai_provider}`\n"
+        f"📦 AI Model: `{s.ai_model}`\n"
+        f"🔑 API Key: `{'Set ✓' if s.api_key else 'Not set'}`\n"
+        f"📋 Report Platform: `{s.report_platform}`\n\n"
+        "*Switch AI Provider:*"
     )
-
-    for scanner in ["xss", "sqli", "ssti", "ssrf", "lfi", "open_redirect", "idor", "api"]:
-        enabled = config.get("scanners", scanner, default={}).get("enabled", True)
-        icon = "✅" if enabled else "❌"
-        text += f"  {icon} {scanner.upper()}\n"
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("OpenAI", callback_data="provider_openai"),
-         InlineKeyboardButton("Anthropic", callback_data="provider_anthropic"),
-         InlineKeyboardButton("Groq", callback_data="provider_groq"),
-         InlineKeyboardButton("Ollama", callback_data="provider_ollama")],
-        [InlineKeyboardButton("HackerOne", callback_data="platform_hackerone"),
-         InlineKeyboardButton("Bugcrowd", callback_data="platform_bugcrowd"),
-         InlineKeyboardButton("Intigriti", callback_data="platform_intigriti")],
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 Ollama (Free)", callback_data="prov_ollama"),
+         InlineKeyboardButton("🔵 OpenAI",        callback_data="prov_openai")],
+        [InlineKeyboardButton("🟣 Anthropic",     callback_data="prov_anthropic"),
+         InlineKeyboardButton("⚡ Groq",          callback_data="prov_groq")],
+        [InlineKeyboardButton("H1 HackerOne",     callback_data="plat_hackerone"),
+         InlineKeyboardButton("BC Bugcrowd",      callback_data="plat_bugcrowd"),
+         InlineKeyboardButton("IT Intigriti",     callback_data="plat_intigriti")],
     ])
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+    await safe_reply(update, text, reply_markup=kb)
 
 
-# ── /setprovider ──────────────────────────────────────────────────────────────
-@auth_required
-async def cmd_set_provider(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text(
-            "Usage: `/setprovider openai|anthropic|groq|ollama`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
+# ─────────────────────────────────────────────────────────────────────────────
+# /mystats
+# ─────────────────────────────────────────────────────────────────────────────
+@auth
+async def cmd_mystats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s = get_session(update.effective_user)
+    all_sessions = list(SESSIONS.values())
+    active_count = sum(1 for sess in all_sessions if sess.is_scanning())
 
-    provider = context.args[0].lower()
-    valid = ["openai", "anthropic", "groq", "ollama"]
-    if provider not in valid:
-        await update.message.reply_text(
-            f"❌ Invalid provider. Choose: `{', '.join(valid)}`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    config.data["ai"]["provider"] = provider
-    config.save()
-    await update.message.reply_text(
-        f"✅ AI provider set to: `{provider}`",
-        parse_mode=ParseMode.MARKDOWN,
+    text = (
+        f"📈 *Your Stats*\n\n"
+        f"👤 Username: `{s.username}`\n"
+        f"🔢 Total scans: `{s.total_scans}`\n"
+        f"⏰ Last scan: `{s.last_scan or 'Never'}`\n"
+        f"🤖 AI Provider: `{s.ai_provider}`\n"
+        f"📋 Platform: `{s.report_platform}`\n\n"
+        f"🌐 *Bot-wide stats:*\n"
+        f"• Active users: `{len(all_sessions)}`\n"
+        f"• Scans running: `{active_count}`\n"
+        f"• Total DB findings: `{db.get_stats().get('total', 0)}`"
     )
+    await safe_reply(update, text)
 
 
-# ── /setkey ───────────────────────────────────────────────────────────────────
-@auth_required
-async def cmd_set_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ─────────────────────────────────────────────────────────────────────────────
+# Config commands
+# ─────────────────────────────────────────────────────────────────────────────
+@auth
+async def cmd_set_provider(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s = get_session(update.effective_user)
+    valid = ["openai", "anthropic", "groq", "ollama"]
+    if not context.args or context.args[0].lower() not in valid:
+        await safe_reply(update, f"Usage: `/setprovider {{'|'.join(valid)}}`")
+        return
+    s.ai_provider = context.args[0].lower()
+    await safe_reply(update, f"✅ AI provider set to: `{s.ai_provider}`")
+
+
+@auth
+async def cmd_set_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s = get_session(update.effective_user)
     if not context.args:
-        await update.message.reply_text(
-            "Usage: `/setkey your-api-key-here`\n⚠️ Your key will be stored in config.json",
-            parse_mode=ParseMode.MARKDOWN,
+        await safe_reply(update,
+            "Usage: `/setmodel <model>`\n\n"
+            "Examples:\n"
+            "• `gpt-4o` (OpenAI)\n"
+            "• `claude-3-5-sonnet-20241022` (Anthropic)\n"
+            "• `llama-3.1-70b-versatile` (Groq)\n"
+            "• `llama3` (Ollama)"
         )
         return
+    s.ai_model = context.args[0]
+    await safe_reply(update, f"✅ AI model set to: `{s.ai_model}`")
 
-    key = context.args[0]
-    config.data["ai"]["api_key"] = key
-    config.save()
 
-    # Delete the message to avoid key exposure in chat
+@auth
+async def cmd_set_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s = get_session(update.effective_user)
+    if not context.args:
+        await safe_reply(update, "Usage: `/setkey your-api-key`")
+        return
+    s.api_key = context.args[0]
     try:
         await update.message.delete()
     except Exception:
         pass
-
     await update.effective_chat.send_message(
-        "✅ *API key saved successfully!*\n_(Your message with the key was deleted for security)_",
+        "✅ *API key saved!* _(Your message was deleted for security)_",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 
-# ── /setmodel ─────────────────────────────────────────────────────────────────
-@auth_required
-async def cmd_set_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text(
-            "Usage: `/setmodel gpt-4o`\n\n"
-            "Examples:\n"
-            "• OpenAI: `gpt-4o`, `gpt-4o-mini`\n"
-            "• Anthropic: `claude-3-5-sonnet-20241022`\n"
-            "• Groq: `llama-3.1-70b-versatile`\n"
-            "• Ollama: `llama3`, `mistral`, `phi3`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+@auth
+async def cmd_set_platform(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s = get_session(update.effective_user)
+    valid = ["hackerone", "bugcrowd", "intigriti", "immunefi"]
+    if not context.args or context.args[0].lower() not in valid:
+        await safe_reply(update, f"Usage: `/setplatform {'|'.join(valid)}`")
         return
-
-    model = context.args[0]
-    config.data["ai"]["model"] = model
-    config.save()
-    await update.message.reply_text(
-        f"✅ AI model set to: `{model}`",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    s.report_platform = context.args[0].lower()
+    await safe_reply(update, f"✅ Report platform set to: `{s.report_platform}`")
 
 
-# ── Inline Button Callbacks ───────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Inline button callbacks
+# ─────────────────────────────────────────────────────────────────────────────
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+    s = get_session(update.effective_user)
 
     if data == "help":
-        await cmd_help.__wrapped__(update, context) if hasattr(cmd_help, '__wrapped__') else None
+        await query.message.reply_text("Use /help to see all commands.")
+    elif data == "myconfig":
+        await query.message.reply_text("Use /myconfig to view your settings.")
+    elif data == "myfindings":
+        await query.message.reply_text("Use /findings to view your latest findings.")
+    elif data == "myreport":
+        await query.message.reply_text("Use /report to receive your latest report file.")
+    elif data.startswith("prov_"):
+        s.ai_provider = data.replace("prov_", "")
         await query.message.reply_text(
-            "Use /help to see all commands.", parse_mode=ParseMode.MARKDOWN
+            f"✅ AI provider switched to: `{s.ai_provider}`",
+            parse_mode=ParseMode.MARKDOWN
         )
-    elif data == "config":
+    elif data.startswith("plat_"):
+        s.report_platform = data.replace("plat_", "")
         await query.message.reply_text(
-            "Use /config to view settings.", parse_mode=ParseMode.MARKDOWN
+            f"✅ Report platform set to: `{s.report_platform}`",
+            parse_mode=ParseMode.MARKDOWN
         )
-    elif data == "findings":
-        await query.message.reply_text(
-            "Use /findings to view latest findings.", parse_mode=ParseMode.MARKDOWN
-        )
-    elif data == "report":
-        await query.message.reply_text(
-            "Use /report to receive the latest report.", parse_mode=ParseMode.MARKDOWN
-        )
-    elif data.startswith("provider_"):
-        provider = data.replace("provider_", "")
-        config.data["ai"]["provider"] = provider
-        config.save()
-        await query.message.reply_text(f"✅ AI provider switched to: `{provider}`",
-                                       parse_mode=ParseMode.MARKDOWN)
-    elif data.startswith("platform_"):
-        platform = data.replace("platform_", "")
-        config.data["reports"]["platform"] = platform
-        config.save()
-        await query.message.reply_text(f"✅ Report platform set to: `{platform}`",
-                                       parse_mode=ParseMode.MARKDOWN)
 
 
-# ── Unknown command handler ───────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Unknown command
+# ─────────────────────────────────────────────────────────────────────────────
 async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "❓ Unknown command. Use /help to see all available commands."
-    )
+    await safe_reply(update, "❓ Unknown command. Use /help to see all commands.")
 
 
-# ── Error Handler ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Error handler
+# ─────────────────────────────────────────────────────────────────────────────
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Telegram error: {context.error}")
-    if isinstance(update, Update) and update.message:
-        await update.message.reply_text(
-            f"⚠️ An error occurred: `{str(context.error)[:200]}`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+    log.error(f"Bot error: {context.error}")
 
 
-# ── Main Bot Runner ───────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Main runner
+# ─────────────────────────────────────────────────────────────────────────────
 def run_bot(token: str, allowed_user_ids: list = None):
-    """Start the Telegram bot."""
     global ALLOWED_USERS
     if allowed_user_ids:
         ALLOWED_USERS = allowed_user_ids
 
-    logger.info("Starting AI-BugBounty-Hunter Telegram Bot...")
+    log.info("Starting AI-BugBounty-Hunter Telegram Bot (Multi-User Mode)...")
+    log.info(f"Authorization: {'Restricted to ' + str(len(ALLOWED_USERS)) + ' users' if ALLOWED_USERS else 'Open to all'}")
 
     app = Application.builder().token(token).build()
 
-    # Register commands
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("scan", cmd_scan))
-    app.add_handler(CommandHandler("quick", cmd_quick))
-    app.add_handler(CommandHandler("recon", cmd_quick))  # Alias
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("cancel", cmd_cancel))
-    app.add_handler(CommandHandler("findings", cmd_findings))
-    app.add_handler(CommandHandler("report", cmd_report))
-    app.add_handler(CommandHandler("config", cmd_config))
+    # Handlers
+    app.add_handler(CommandHandler("start",       cmd_start))
+    app.add_handler(CommandHandler("help",        cmd_help))
+    app.add_handler(CommandHandler("scan",        cmd_scan))
+    app.add_handler(CommandHandler("quick",       cmd_quick))
+    app.add_handler(CommandHandler("recon",       cmd_quick))
+    app.add_handler(CommandHandler("status",      cmd_status))
+    app.add_handler(CommandHandler("cancel",      cmd_cancel))
+    app.add_handler(CommandHandler("findings",    cmd_findings))
+    app.add_handler(CommandHandler("report",      cmd_report))
+    app.add_handler(CommandHandler("myconfig",    cmd_myconfig))
+    app.add_handler(CommandHandler("mystats",     cmd_mystats))
     app.add_handler(CommandHandler("setprovider", cmd_set_provider))
-    app.add_handler(CommandHandler("setkey", cmd_set_key))
-    app.add_handler(CommandHandler("setmodel", cmd_set_model))
+    app.add_handler(CommandHandler("setmodel",    cmd_set_model))
+    app.add_handler(CommandHandler("setkey",      cmd_set_key))
+    app.add_handler(CommandHandler("setplatform", cmd_set_platform))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
     app.add_error_handler(error_handler)
 
-    # Set bot command list (shows in Telegram menu)
-    commands = [
-        BotCommand("start", "Welcome screen"),
-        BotCommand("scan", "Full AI scan: /scan example.com"),
-        BotCommand("quick", "Quick passive recon: /quick example.com"),
-        BotCommand("status", "Current scan status"),
-        BotCommand("findings", "View latest findings"),
-        BotCommand("report", "Get report file"),
-        BotCommand("cancel", "Cancel running scan"),
-        BotCommand("config", "View/change settings"),
-        BotCommand("setprovider", "Set AI provider"),
-        BotCommand("setkey", "Set API key"),
-        BotCommand("setmodel", "Set AI model"),
-        BotCommand("help", "Show all commands"),
-    ]
-
+    # Bot command menu
     async def post_init(application: Application):
-        await application.bot.set_my_commands(commands)
+        await application.bot.set_my_commands([
+            BotCommand("start",       "Welcome screen"),
+            BotCommand("scan",        "Full AI scan: /scan example.com"),
+            BotCommand("quick",       "Passive recon: /quick example.com"),
+            BotCommand("status",      "Your scan progress"),
+            BotCommand("findings",    "View findings"),
+            BotCommand("report",      "Get report file"),
+            BotCommand("cancel",      "Cancel your scan"),
+            BotCommand("myconfig",    "Your settings"),
+            BotCommand("mystats",     "Your scan stats"),
+            BotCommand("setprovider", "Set AI provider"),
+            BotCommand("setmodel",    "Set AI model"),
+            BotCommand("setkey",      "Set API key"),
+            BotCommand("setplatform", "Set report platform"),
+            BotCommand("help",        "All commands"),
+        ])
+        log.info("Bot command menu registered.")
 
     app.post_init = post_init
 
-    logger.info("Bot is running. Press Ctrl+C to stop.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    log.info("Bot running. Press Ctrl+C to stop.")
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Load token from environment or config
     TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
     ALLOWED_IDS_STR = os.getenv("TELEGRAM_ALLOWED_USERS", "")
 
     if not TOKEN:
-        # Try loading from bot_config.json
-        bot_cfg_path = Path("bot_config.json")
-        if bot_cfg_path.exists():
-            with open(bot_cfg_path) as f:
+        cfg_path = Path("bot_config.json")
+        if cfg_path.exists():
+            with open(cfg_path, encoding="utf-8") as f:
                 bot_cfg = json.load(f)
             TOKEN = bot_cfg.get("telegram_token", "")
-            ALLOWED_IDS_STR = str(bot_cfg.get("allowed_user_ids", ""))
+            allowed_list = bot_cfg.get("allowed_user_ids", [])
+            if allowed_list:
+                ALLOWED_IDS_STR = ",".join(str(x) for x in allowed_list)
 
     if not TOKEN:
-        print("\n  ❌ No Telegram bot token found!")
-        print("  Set it with one of these methods:")
-        print("  1. Environment variable:  set TELEGRAM_BOT_TOKEN=your-token")
-        print("  2. bot_config.json:       {\"telegram_token\": \"your-token\"}")
-        print("  3. Argument:              python telegram_bot.py YOUR_TOKEN\n")
         if len(sys.argv) > 1:
             TOKEN = sys.argv[1]
         else:
+            print("\n  ERROR: No Telegram bot token found!")
+            print("  1. Set env:  TELEGRAM_BOT_TOKEN=your-token")
+            print("  2. Edit bot_config.json: {\"telegram_token\": \"your-token\"}")
+            print("  3. Pass directly: python telegram_bot.py YOUR_TOKEN\n")
             sys.exit(1)
 
     allowed_ids = []
