@@ -10,7 +10,7 @@
         "ollama_url": "http://localhost:11434"
     },
     "target": {
-        "domain": "",
+        "domain": "instagram.com",
         "scope": [],
         "exclude": [],
         "rate_limit": 10,
@@ -33,15 +33,42 @@
         "ffuf_path": "ffuf"
     },
     "scanners": {
-        "xss": {"enabled": true, "blind_xss_enabled": true, "dom_xss_enabled": true},
-        "sqli": {"enabled": true, "time_based": true, "error_based": true, "boolean_based": true},
-        "ssti": {"enabled": true},
-        "ssrf": {"enabled": true, "oob_enabled": true},
-        "lfi": {"enabled": true},
-        "open_redirect": {"enabled": true},
-        "idor": {"enabled": true, "auto_detect_params": true},
-        "api": {"enabled": true, "graphql_enabled": true},
-        "web3": {"enabled": false, "chain": "ethereum"}
+        "xss": {
+            "enabled": true,
+            "blind_xss_enabled": true,
+            "dom_xss_enabled": true
+        },
+        "sqli": {
+            "enabled": true,
+            "time_based": true,
+            "error_based": true,
+            "boolean_based": true
+        },
+        "ssti": {
+            "enabled": true
+        },
+        "ssrf": {
+            "enabled": true,
+            "oob_enabled": true
+        },
+        "lfi": {
+            "enabled": true
+        },
+        "open_redirect": {
+            "enabled": true
+        },
+        "idor": {
+            "enabled": true,
+            "auto_detect_params": true
+        },
+        "api": {
+            "enabled": true,
+            "graphql_enabled": true
+        },
+        "web3": {
+            "enabled": false,
+            "chain": "ethereum"
+        }
     },
     "ai_engine": {
         "validation_gate_enabled": true,
